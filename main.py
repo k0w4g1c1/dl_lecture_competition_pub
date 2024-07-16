@@ -10,7 +10,10 @@ import torch
 import torch.nn as nn
 import torchvision
 from torchvision import transforms
-
+from torch.nn.utils.rnn import pad_sequence
+import numpy as np
+import datetime
+from torch.nn import init
 
 def set_seed(seed):
     random.seed(seed)
@@ -21,6 +24,11 @@ def set_seed(seed):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
+#gensimのインストールとword2vecの作成
+!pip install gensim
+from gensim.models import KeyedVectors
+
+word2vec = KeyedVectors.load_word2vec_format("/content/drive/MyDrive/Colab Notebooks/DLBasics2024_colab/最終課題/VQA/dl_lecture_competition_pub/GoogleNews-vectors-negative300.bin", binary=True)
 
 def process_text(text):
     # lowercase
@@ -63,10 +71,11 @@ def process_text(text):
 
 # 1. データローダーの作成
 class VQADataset(torch.utils.data.Dataset):
-    def __init__(self, df_path, image_dir, transform=None, answer=True):
+    def __init__(self, df_path, image_dir, class_mapping_path, transform=None, answer=True):
         self.transform = transform  # 画像の前処理
         self.image_dir = image_dir  # 画像ファイルのディレクトリ
         self.df = pandas.read_json(df_path)  # 画像ファイルのパス，question, answerを持つDataFrame
+        self.class_mapping = pandas.read_csv(class_mapping_path)
         self.answer = answer
 
         # question / answerの辞書を作成
@@ -81,7 +90,7 @@ class VQADataset(torch.utils.data.Dataset):
             words = question.split(" ")
             for word in words:
                 if word not in self.question2idx:
-                    self.question2idx[word] = len(self.question2idx)
+                    self.question2idx[word] = len(self.question2idx) +1 #padding用に0を空けておく
         self.idx2question = {v: k for k, v in self.question2idx.items()}  # 逆変換用の辞書(question)
 
         if self.answer:
@@ -92,6 +101,11 @@ class VQADataset(torch.utils.data.Dataset):
                     word = process_text(word)
                     if word not in self.answer2idx:
                         self.answer2idx[word] = len(self.answer2idx)
+            # huggingfaceのclass_mappingを読み込み回答用の辞書に追加する
+            for answer in self.class_mapping["answer"]:
+                word = process_text(answer)
+                if word not in self.answer2idx:
+                    self.answer2idx[word] = len(self.answer2idx)
             self.idx2answer = {v: k for k, v in self.answer2idx.items()}  # 逆変換用の辞書(answer)
 
     def update_dict(self, dataset):
@@ -130,13 +144,13 @@ class VQADataset(torch.utils.data.Dataset):
         """
         image = Image.open(f"{self.image_dir}/{self.df['image'][idx]}")
         image = self.transform(image)
-        question = np.zeros(len(self.idx2question) + 1)  # 未知語用の要素を追加
-        question_words = self.df["question"][idx].split(" ")
+        question_words = [process_text(word) for word in self.df["question"][idx].split(" ")]  #question_words = self.df["question"][idx].split(" ")
+        question = [] #question = np.zeros(len(self.idx2question) + 1)  # 未知語用の要素を追加
         for word in question_words:
             try:
-                question[self.question2idx[word]] = 1  # one-hot表現に変換
+                question.append(self.question2idx[word]) #question[self.question2idx[word]] = 1  # one-hot表現に変換
             except KeyError:
-                question[-1] = 1  # 未知語
+                question.append(len(self.idx2question) + 1) #未知語には　＋１の数を適用 question[-1] = 1  # 未知語
 
         if self.answer:
             answers = [self.answer2idx[process_text(answer["answer"])] for answer in self.df["answers"][idx]]
@@ -286,12 +300,14 @@ def ResNet18():
 def ResNet50():
     return ResNet(BottleneckBlock, [3, 4, 6, 3])
 
+device = "cuda" if torch.cuda.is_available() else "cpu"
 
 class VQAModel(nn.Module):
-    def __init__(self, vocab_size: int, n_answer: int):
+    def __init__(self, n_answer: int, embedding_matrix):
         super().__init__()
         self.resnet = ResNet18()
-        self.text_encoder = nn.Linear(vocab_size, 512)
+        self.embedding = nn.Embedding.from_pretrained(embedding_matrix, freeze=False) # embedding matrixで重みを初期化
+        self.lstm = nn.LSTM(300, 512, batch_first=True)
 
         self.fc = nn.Sequential(
             nn.Linear(1024, 512),
@@ -301,7 +317,8 @@ class VQAModel(nn.Module):
 
     def forward(self, image, question):
         image_feature = self.resnet(image)  # 画像の特徴量
-        question_feature = self.text_encoder(question)  # テキストの特徴量
+        output_seq, (h_n, c_n) = self.lstm(self.embedding(question))
+        question_feature = output_seq[:, -1, :]  # テキストの特徴量
 
         x = torch.cat([image_feature, question_feature], dim=1)
         x = self.fc(x)
@@ -320,7 +337,7 @@ def train(model, dataloader, optimizer, criterion, device):
     start = time.time()
     for image, question, answers, mode_answer in dataloader:
         image, question, answer, mode_answer = \
-            image.to(device), question.to(device), answers.to(device), mode_answer.to(device)
+            image.to(device), question.to(dtype=torch.long, device=device), answers.to(device), mode_answer.to(device)
 
         pred = model(image, question)
         loss = criterion(pred, mode_answer.squeeze())
@@ -346,7 +363,7 @@ def eval(model, dataloader, optimizer, criterion, device):
     start = time.time()
     for image, question, answers, mode_answer in dataloader:
         image, question, answer, mode_answer = \
-            image.to(device), question.to(device), answers.to(device), mode_answer.to(device)
+            image.to(device), question.to(dtype=torch.long, device=device), answers.to(device), mode_answer.to(device)
 
         pred = model(image, question)
         loss = criterion(pred, mode_answer.squeeze())
@@ -364,21 +381,66 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # dataloader / model
-    transform = transforms.Compose([
+    transform_train = transforms.Compose([
         transforms.Resize((224, 224)),
-        transforms.ToTensor()
+        transforms.RandomHorizontalFlip(p=0.3), #ランダムに水平方向に30℃回転させる
+        transforms.RandomCrop(224, padding=20), #ランダムにPaddingして画像の一部を切り出す
+        transforms.RandomRotation(20), #ランダムに20℃回転させる
+        transforms.ToTensor(),
+        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)) #RGBの各チャネルが取りうる値を「－1～1」に正規化
     ])
-    train_dataset = VQADataset(df_path="./data/train.json", image_dir="./data/train", transform=transform)
-    test_dataset = VQADataset(df_path="./data/valid.json", image_dir="./data/valid", transform=transform, answer=False)
+
+    transform_val = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)) #RGBの各チャネルが取りうる値を「－1～1」に正規化
+    ])
+    class_mapping_path = "/content/drive/MyDrive/Colab Notebooks/DLBasics2024_colab/最終課題/VQA/dl_lecture_competition_pub/class_mapping.csv"
+    train_dataset = VQADataset(df_path="./data/train.json", image_dir="./data/train", class_mapping_path=class_mapping_path, transform=transform_train)
+    test_dataset = VQADataset(df_path="./data/valid.json", image_dir="./data/valid",class_mapping_path=class_mapping_path, transform=transform_val, answer=False)
     test_dataset.update_dict(train_dataset)
 
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=128, shuffle=True)
+    #embedding matrix
+    #unkownには，word2vecの全単語の平均のベクトルを適用する
+    unk_vector = torch.from_numpy(np.mean(word2vec.vectors, axis=0))
+    embedding_matrix = torch.zeros((len(train_dataset.question2idx) + 2, 300)) #paddingの+1、入力の末尾の未知語分+1する
+
+    for word, index in train_dataset.question2idx.items():
+        if word in word2vec:
+            embedding_matrix[index] = torch.from_numpy(word2vec[word])
+        else:
+            embedding_matrix[index] = unk_vector
+
+    embedding_matrix[-1] = unk_vector  #入力の末尾の未知語分もunkownを適用する
+    embedding_matrix.to(device)
+
+    def collate_batch(batch):
+        image_list = []
+        text_list = []
+        answers_list = []
+        mode_answer_idx_list = []
+        for image, question, answers, mode_answer_idx in batch:
+            image_list.append(image.tolist())
+            text_list.append(question)
+            answers_list.append(answers.tolist())
+            mode_answer_idx_list.append(mode_answer_idx)
+
+        question = pad_sequence(text_list, batch_first=True, padding_value=0)
+        return torch.tensor(image_list), question, torch.tensor(answers_list), torch.tensor(mode_answer_idx_list)
+
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=128, collate_fn=collate_batch, shuffle=True)#train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=128, shuffle=True)
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False)
 
-    model = VQAModel(vocab_size=len(train_dataset.question2idx)+1, n_answer=len(train_dataset.answer2idx)).to(device)
+    model = VQAModel(n_answer=len(train_dataset.answer2idx), embedding_matrix=embedding_matrix).to(device) #vocab_sizeを消去
+    #重みパラメータに対してKaiming初期化を行う
+    for name, param in model.named_parameters():
+        if "weight" in name:
+            if "conv" in name or "fc" in name:
+                param = init.kaiming_normal_(param)
+    # model.load_state_dict(torch.load('/content/model_20240711_0654_8.pth'))
 
     # optimizer / criterion
-    num_epoch = 20
+    num_epoch = 2
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
 
@@ -395,15 +457,17 @@ def main():
     model.eval()
     submission = []
     for image, question in test_loader:
-        image, question = image.to(device), question.to(device)
+        image, question = image.to(device), question.to(dtype=torch.long, device=device)
         pred = model(image, question)
         pred = pred.argmax(1).cpu().item()
         submission.append(pred)
 
     submission = [train_dataset.idx2answer[id] for id in submission]
     submission = np.array(submission)
-    torch.save(model.state_dict(), "model.pth")
-    np.save("submission.npy", submission)
+    now = datetime.datetime.now()
+    torch.save(model.state_dict(), "model_" + now.strftime('%Y%m%d_%H%M') + ".pth")#torch.save(model.state_dict(), "model.pth")
+    np.save("submission_" + now.strftime('%Y%m%d_%H%M') + ".npy", submission) #np.save("submission.npy", submission)
 
 if __name__ == "__main__":
     main()
+
